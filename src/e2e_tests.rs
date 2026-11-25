@@ -364,6 +364,84 @@ async fn send_forward_bounce_and_webhooks() {
     assert_eq!(webhook::deliver_due(&h.app).await.unwrap(), 0, "delivered events are not resent");
 }
 
+// hosts which accept the connection but then send no data (example: broken ELB)
+async fn blackhole_hosts(n: usize) -> Vec<(String, u16)> {
+    let mut hosts = Vec::new();
+    for _ in 0..n {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        hosts.push(("127.0.0.1".to_string(), l.local_addr().unwrap().port()));
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((s, _)) = l.accept().await {
+                held.push(s);
+            }
+        });
+    }
+    hosts
+}
+
+/// The outbox is processed by a single worker and walks the receiving 
+// domain's MXs until it finds a working one. If they broken (or malicious)
+// each ties the worker up for the connect timeout duration
+//
+// Added as POC, run with:
+//
+// cargo test --lib poc_mx -- --ignored --nocapture
+#[tokio::test]
+#[ignore = "minutes: each blackholed host burns a real connect timeout"]
+async fn poc_mx_fanout_stalls_the_whole_outbox() {
+    let h = harness().await;
+    let m = crate::db::MessageRow {
+        id: "poc".into(),
+        site: "party".into(),
+        batch_id: "poc".into(),
+        kind: "forward".into(),
+        domain: "sloth.test".into(),
+        mail_from: "bounce+poc@sloth.test".into(),
+        rcpt_to: "victim@evil.test".into(),
+        from_header: "a@b.test".into(),
+        subject: "poc".into(),
+        raw: b"Subject: poc\r\n\r\nx\r\n".to_vec(),
+        status: "sending".into(),
+        attempts: 0,
+        next_attempt_at: None,
+        last_error: None,
+        created_at: crate::util::now(),
+        updated_at: crate::util::now(),
+        sent_at: None,
+    };
+
+    // What one unreachable host costs us.
+    let one = blackhole_hosts(1).await;
+    let start = std::time::Instant::now();
+    let outcome = deliver::try_hosts(&h.app, one, &m, &m.raw).await;
+    let per_host = start.elapsed();
+    println!("1 blackholed MX host:  stalled {per_host:?} -> {outcome:?}");
+    assert!(matches!(outcome, Outcome::Deferred(_)), "{outcome:?}");
+
+    // Now twenty, through the same path a real MX answer takes. Uncapped
+    // that is twenty times the above; the cap is what keeps it a constant.
+    let many = blackhole_hosts(20).await;
+    let names: Vec<String> = many.iter().map(|(h, p)| format!("{h}:{p}")).collect();
+    let hosts = deliver::mx_hosts(names.iter(), "evil.test").unwrap();
+    let hosts: Vec<(String, u16)> = hosts
+        .iter()
+        .map(|(hp, _)| {
+            let (host, port) = hp.rsplit_once(':').unwrap();
+            (host.to_string(), port.parse().unwrap())
+        })
+        .collect();
+    let start = std::time::Instant::now();
+    let outcome = deliver::try_hosts(&h.app, hosts, &m, &m.raw).await;
+    let total = start.elapsed();
+    println!("20 blackholed MX hosts: stalled {total:?} -> {outcome:?}");
+    assert!(
+        total < per_host * 8,
+        "20 MX records cost {total:?}, roughly {:.0}x one host",
+        total.as_secs_f64() / per_host.as_secs_f64()
+    );
+}
+
 #[tokio::test]
 async fn oversized_and_malformed_input_is_refused() {
     let h = harness().await;

@@ -30,6 +30,11 @@ const RETRY_SECONDS: [i64; 8] = [60, 300, 900, 3600, 4 * 3600, 12 * 3600, 24 * 3
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(75);
 const SESSION_TIMEOUT: Duration = Duration::from_secs(300);
 
+// How many of a hosts MX records should we try if we have to iterate through?
+const MAX_MX_HOSTS: usize = 5;
+// What's the per host maximum duration?
+const DELIVERY_DEADLINE: Duration = Duration::from_secs(600);
+
 #[derive(Debug)]
 pub enum Outcome {
     Sent(String),
@@ -37,7 +42,8 @@ pub enum Outcome {
     Failed(String),
 }
 
-enum HostError {
+#[derive(Debug)]
+pub(crate) enum HostError {
     Temporary(String),
     Permanent(String),
 }
@@ -151,9 +157,38 @@ pub async fn deliver(app: &App, m: &MessageRow) -> Outcome {
         Err(HostError::Temporary(e)) => return Outcome::Deferred(e),
         Err(HostError::Permanent(e)) => return Outcome::Failed(e),
     };
+    try_hosts(app, hosts, m, &raw).await
+}
+
+/// Return list of MXs to try, in the order the resolver returned them
+/// number is capped: see [`MAX_MX_HOSTS`].
+pub(crate) fn mx_hosts<S: AsRef<str>>(exchanges: impl Iterator<Item = S>, domain: &str) -> Result<Vec<(String, u16)>, HostError> {
+    let mut hosts = Vec::new();
+    for ex in exchanges {
+        let ex = ex.as_ref().trim_end_matches('.');
+        if ex.is_empty() {
+            // RFC 7505 null MX: the domain takes no mail.
+            return Err(HostError::Permanent(format!("{domain} does not accept mail (null MX)")));
+        }
+        hosts.push((ex.to_string(), 25));
+    }
+    if hosts.is_empty() {
+        hosts.push((domain.to_string(), 25));
+    }
+    hosts.truncate(MAX_MX_HOSTS);
+    Ok(hosts)
+}
+
+/// Try each host in turn, stop at the first that gives a result
+pub(crate) async fn try_hosts(app: &App, hosts: Vec<(String, u16)>, m: &MessageRow, raw: &[u8]) -> Outcome {
+    let deadline = std::time::Instant::now() + DELIVERY_DEADLINE;
     let mut last = "no MX host reachable".to_string();
     for (host, port) in hosts {
-        match tokio::time::timeout(SESSION_TIMEOUT, try_host(app, &host, port, m, &raw)).await {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return Outcome::Deferred(format!("{last}; out of time after {}s", DELIVERY_DEADLINE.as_secs()));
+        }
+        match tokio::time::timeout(SESSION_TIMEOUT.min(left), try_host(app, &host, port, m, raw)).await {
             Ok(Ok(reply)) => return Outcome::Sent(format!("{host}: {reply}")),
             Ok(Err(HostError::Permanent(e))) => return Outcome::Failed(format!("{host}: {e}")),
             Ok(Err(HostError::Temporary(e))) => last = format!("{host}: {e}"),
@@ -170,23 +205,7 @@ async fn resolve_mx(app: &App, domain: &str) -> Result<Vec<(String, u16)>, HostE
         return Ok(vec![(host.to_string(), port.parse().unwrap_or(25))]);
     }
     match app.resolver.mx_lookup(domain, None::<&NoCache<Box<str>, RecordSet<MX>>>).await {
-        Ok(set) => {
-            let mut hosts = Vec::new();
-            for mx in set.rrset.iter() {
-                for ex in mx.exchanges.iter() {
-                    let ex = ex.trim_end_matches('.');
-                    if ex.is_empty() {
-                        // RFC 7505 null MX: the domain says it takes no mail.
-                        return Err(HostError::Permanent(format!("{domain} does not accept mail (null MX)")));
-                    }
-                    hosts.push((ex.to_string(), 25));
-                }
-            }
-            if hosts.is_empty() {
-                hosts.push((domain.to_string(), 25));
-            }
-            Ok(hosts)
-        }
+        Ok(set) => mx_hosts(set.rrset.iter().flat_map(|mx| mx.exchanges.iter()), domain),
         Err(mail_auth::Error::Dns(DnsError::RecordNotFound(ResponseCode::NXDomain))) => {
             Err(HostError::Permanent(format!("no such domain: {domain}")))
         }
@@ -339,6 +358,23 @@ mod tests {
         assert_eq!(reply_text(&esc), "550 5.1.1 no such user");
         assert!(matches!(classify(SmtpError::UnexpectedReply(r(451))), HostError::Temporary(_)));
         assert!(matches!(classify(SmtpError::Timeout), HostError::Temporary(_)));
+    }
+
+    #[test]
+    fn the_mx_host_list_is_capped() {
+        // A domain can publish as many MX records as it wants
+        // each one can timeout, backing up the queue
+        let many: Vec<String> = (0..20).map(|i| format!("mx{i}.evil.test.")).collect();
+        let hosts = mx_hosts(many.iter(), "evil.test").unwrap();
+        assert_eq!(hosts.len(), MAX_MX_HOSTS, "the recipient must not pick how many hosts we try");
+        assert_eq!(hosts[0], ("mx0.evil.test".to_string(), 25));
+        // A domain with no MX at all still falls back to itself.
+        assert_eq!(
+            mx_hosts(std::iter::empty::<&str>(), "plain.test").unwrap(),
+            vec![("plain.test".to_string(), 25)]
+        );
+        // RFC 7505 null MX is still a permanent failure, not a cap.
+        assert!(matches!(mx_hosts(std::iter::once(""), "none.test"), Err(HostError::Permanent(_))));
     }
 
     #[test]
